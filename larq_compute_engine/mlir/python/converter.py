@@ -17,25 +17,26 @@ from tensorflow.python.eager import def_function
 from tensorflow.python.framework.convert_to_constants import (
     convert_variables_to_constants_v2,
 )
-from tensorflow.python.keras.saving import saving_utils
 
 
 def concrete_function_from_keras_model(model):
-    input_signature = None
-    # If the model's call is not a `tf.function`, then we need to first get its
-    # input signature from `model_input_signature` method. We can't directly
-    # call `trace_model_call` because otherwise the batch dimension is set
-    # to None.
-    # Once we have better support for dynamic shapes, we can remove this.
-    if not isinstance(model.call, def_function.Function):
-        # Pass `keep_original_batch_size=True` will ensure that we get an input
-        # signature including the batch dimension specified by the user.
-        input_signature = saving_utils.model_input_signature(
-            model, keep_original_batch_size=True
-        )
+    if not model.inputs:
+        raise ValueError("El modelo no tiene entradas definidas.")
+    # Si el modelo tiene una única entrada:
+    if len(model.inputs) == 1:
+        input_shape = model.inputs[0].shape
+        input_dtype = model.inputs[0].dtype
+        # Se mantiene el batch dimension definido en el modelo.
+        input_spec = tf.TensorSpec(input_shape, input_dtype)
+    else:
+        # Para modelos con múltiples entradas, se genera una lista de TensorSpec.
+        input_spec = [
+            tf.TensorSpec(tensor.shape, tensor.dtype) for tensor in model.inputs
+        ]
 
-    func = saving_utils.trace_model_call(model, input_signature)
-    return func.get_concrete_function()
+    # Obtiene la función concreta a partir del input_spec.
+    concrete_func = model.get_concrete_function(input_spec)
+    return concrete_func
 
 
 def _contains_training_quant_op(graph_def):
@@ -199,24 +200,26 @@ def convert_keras_model(
         raise ValueError(
             f"Expected `model` argument to be a `tf.keras.Model` instance, got `{model}`."
         )
+    print('Es un modelo de keras')
     if hasattr(model, "dtype_policy") and model.dtype_policy.name != "float32":
         raise ValueError(
             "Mixed precision float16 models are not supported by the TFLite converter, "
             "please convert them to float32 first. See also: "
             "https://github.com/tensorflow/tensorflow/issues/46380"
         )
+    print('Se acepto la policy')
     _validate_options(
         inference_input_type=inference_input_type,
         inference_output_type=inference_output_type,
         target=target,
         experimental_default_int8_range=experimental_default_int8_range,
     )
-
+    print('paso la validacion')
     # First attempt conversion as saved model
     try:
         with tempfile.TemporaryDirectory() as saved_model_dir:
             model.save(saved_model_dir, save_format="tf")
-
+            print('Guardado el modelo')
             return convert_saved_model(
                 saved_model_dir,
                 inference_input_type=inference_input_type,
@@ -224,23 +227,29 @@ def convert_keras_model(
                 experimental_default_int8_range=experimental_default_int8_range,
                 target=target,
             )
-    except Exception:
+        print('Se convirtio el modelo')
+    except Exception as e:
+        print('Error al convertir el modelo', e)
         warnings.warn(
             "Saved-model conversion failed, falling back to graphdef-based conversion."
         )
-
     func = concrete_function_from_keras_model(model)
+    print('Se obtuvo la funcion concreta')
     frozen_func = convert_variables_to_constants_v2(func, lower_control_flow=False)
+    print('Se convirtio a constantes')
     input_tensors = [
         tensor for tensor in frozen_func.inputs if tensor.dtype != tf.dtypes.resource
     ]
+    print('Se obtuvieron los tensores de entrada')
     output_tensors = frozen_func.outputs
-
+    print('Se obtuvieron los tensores de salida')
     graph_def = frozen_func.graph.as_graph_def()
+    print('Se obtuvo el grafo')
     should_quantize = (
         _contains_training_quant_op(graph_def)
         or experimental_default_int8_range is not None
     )
+    print('Se debe cuantizar')
 
     # Checks dimensions in input tensor.
     for tensor in input_tensors:
